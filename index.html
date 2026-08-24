@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="pt-BR">
+<html lang="pt-BR" class="tfd-booting">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -342,11 +342,46 @@
             main { padding: 0 !important; margin: 0 !important; max-width: 100% !important; }
             .tab-content { padding: 0 !important; box-shadow: none !important; border: none !important; background: transparent !important; }
         }
+    
+        /* Evita o "pisca" da tela de login durante a leitura assíncrona do IndexedDB.
+           Enquanto o bootstrap decide se há token válido, nenhuma das duas telas é exibida. */
+        html.tfd-booting #login-screen,
+        html.tfd-booting #app-screen {
+            visibility: hidden !important;
+        }
+
+    
+        /* Durante F5/reload nenhuma tela do sistema (nem login) pode aparecer ao fundo. */
+        html.tfd-reload-sync #login-screen,
+        html.tfd-reload-sync #app-screen {
+            visibility: hidden !important;
+            pointer-events: none !important;
+        }
+        #tfd-reload-sync-overlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            z-index: 999999;
+            background: #f5f6fa;
+            align-items: center;
+            justify-content: center;
+            flex-direction: column;
+            gap: 14px;
+            font-family: inherit;
+        }
+        html.tfd-reload-sync #tfd-reload-sync-overlay {
+            display: flex !important;
+        }
+
     </style>
 
     <script src="https://cdn.sheetjs.com/xlsx-latest/package/dist/xlsx.full.min.js"></script>
 </head>
 <body>
+    <div id="tfd-reload-sync-overlay" aria-live="polite">
+        <div style="font-size:18px;font-weight:600;">Sincronizando com o banco de dados...</div>
+        <div style="font-size:14px;opacity:.75;">Aguarde um momento</div>
+    </div>
 
     <!-- RODAPÉ GLOBAL DO SISTEMA -->
     <div class="system-footer">Criado por: Marcos Paulo Cordeiro</div>
@@ -584,6 +619,7 @@
                         
                         <form id="form-viagem" onsubmit="salvarViagem(event)">
                             <input type="hidden" id="via-id">
+                            <input type="hidden" id="via-rpb-original">
 
                             <div class="form-section">
                                 <div class="form-grid">
@@ -1739,17 +1775,214 @@
             if (overlay) overlay.style.display = show ? 'flex' : 'none';
         }
 
-        async function carregarDadosDaNuvem(isPageReload = false) {
-            const localCache = localStorage.getItem('TFD_LOCAL_DB');
-            const deveMostrarLoading = isPageReload;
+        // ===== ARMAZENAMENTO LOCAL: IndexedDB como primário, localStorage apenas como fallback de migração =====
+        const TFD_DB_NAME = 'TFD_DVADR_CACHE';
+        const TFD_DB_VERSION = 1;
+        let tfdDbPromise = null;
+        function abrirTFDDB() {
+            if (!('indexedDB' in window)) return Promise.reject(new Error('IndexedDB indisponível'));
+            if (tfdDbPromise) return tfdDbPromise;
+            tfdDbPromise = new Promise((resolve, reject) => {
+                const req = indexedDB.open(TFD_DB_NAME, TFD_DB_VERSION);
+                req.onupgradeneeded = () => { const db=req.result; if(!db.objectStoreNames.contains('kv')) db.createObjectStore('kv'); };
+                req.onsuccess = () => resolve(req.result);
+                req.onerror = () => reject(req.error);
+            });
+            return tfdDbPromise;
+        }
+        async function idbGet(chave) { const db=await abrirTFDDB(); return new Promise((resolve,reject)=>{const tx=db.transaction('kv','readonly');const r=tx.objectStore('kv').get(chave);r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error);}); }
+        async function idbSet(chave, valor) { const db=await abrirTFDDB(); return new Promise((resolve,reject)=>{const tx=db.transaction('kv','readwrite');tx.objectStore('kv').put(valor,chave);tx.oncomplete=()=>resolve();tx.onerror=()=>reject(tx.error);}); }
+        async function salvarBancoLocal(dados) { try { await idbSet('database', dados); } catch(e) { localStorage.setItem('TFD_LOCAL_DB', JSON.stringify(dados)); } }
+        async function carregarBancoLocal() { try { const d=await idbGet('database'); if(d) return d; const legado=localStorage.getItem('TFD_LOCAL_DB'); return legado?JSON.parse(legado):null; } catch(e) { const legado=localStorage.getItem('TFD_LOCAL_DB'); return legado?JSON.parse(legado):null; } }
+        async function salvarFilaLocal(fila) { try { await idbSet('offlineQueue', fila); } catch(e) { localStorage.setItem('TFD_OFFLINE_QUEUE', JSON.stringify(fila)); } }
+        async function carregarFilaLocal() { try { const f=await idbGet('offlineQueue'); return Array.isArray(f)?f:(JSON.parse(localStorage.getItem('TFD_OFFLINE_QUEUE'))||[]); } catch(e) { return JSON.parse(localStorage.getItem('TFD_OFFLINE_QUEUE'))||[]; } }
+        async function obterMetaSync() { try { return await idbGet('syncMeta') || {}; } catch(e) { return JSON.parse(localStorage.getItem('TFD_SYNC_META')||'{}'); } }
+        async function salvarMetaSync(meta) { try { await idbSet('syncMeta', meta); } catch(e) { localStorage.setItem('TFD_SYNC_META', JSON.stringify(meta)); } }
+
+        // ===== SESSÃO PERSISTENTE: token no IndexedDB, validade até o final do dia =====
+        const TFD_SESSION_KEY = 'session';
+        function fimDoDiaISO() {
+            const agora = new Date();
+            const fim = new Date(agora);
+            fim.setHours(23, 59, 59, 999);
+            return fim.toISOString();
+        }
+
+        async function salvarSessaoLocal(sessao) {
+            const limpa = {
+                token: String(sessao.token || ''),
+                usuario: {
+                    username: sessao.usuario?.username || '',
+                    isAdmin: !!sessao.usuario?.isAdmin
+                },
+                criadoEm: sessao.criadoEm || new Date().toISOString(),
+                expiraEm: sessao.expiraEm || fimDoDiaISO()
+            };
+            await idbSet(TFD_SESSION_KEY, limpa);
+            return limpa;
+        }
+
+        function sessaoAindaValeHoje(sessao) {
+            if (!sessao || !sessao.expiraEm) return false;
+            const agora = new Date();
+            const expira = new Date(sessao.expiraEm);
+            return expira.getTime() > agora.getTime() &&
+                   expira.getFullYear() === agora.getFullYear() &&
+                   expira.getMonth() === agora.getMonth() &&
+                   expira.getDate() === agora.getDate();
+        }
+
+        async function carregarSessaoLocal() {
+            try {
+                const sessao = await idbGet(TFD_SESSION_KEY);
+                if (!sessao || !sessao.token || !sessao.expiraEm) return null;
+                if (!sessaoAindaValeHoje(sessao)) {
+                    await removerSessaoLocal();
+                    return null;
+                }
+                return sessao;
+            } catch (e) {
+                console.warn('Não foi possível carregar a sessão local:', e);
+                return null;
+            }
+        }
+
+        async function removerSessaoLocal() {
+            try {
+                const db = await abrirTFDDB();
+                await new Promise((resolve, reject) => {
+                    const tx = db.transaction('kv', 'readwrite');
+                    tx.objectStore('kv').delete(TFD_SESSION_KEY);
+                    tx.oncomplete = () => resolve();
+                    tx.onerror = () => reject(tx.error);
+                });
+            } catch (e) {
+                console.warn('Não foi possível remover a sessão local:', e);
+            }
+        }
+
+        async function validarSessaoPersistida() {
+            const sessao = await carregarSessaoLocal();
+            if (!sessao) return null;
+
+            // Verificação instantânea local: não espera a nuvem para liberar a interface.
+            if (!sessaoAindaValeHoje(sessao)) {
+                await removerSessaoLocal();
+                return null;
+            }
+
+            return sessao;
+        }
+
+        async function validarSessaoRemotamenteEmSegundoPlano(sessao) {
+            try {
+                const resposta = await postJSONSeguro(
+                    { action: 'validarSessao', token: sessao.token },
+                    6000
+                );
+
+                if (resposta.status !== 'sucesso' || !resposta.usuario) {
+                    await removerSessaoLocal();
+
+                    // Se o token foi revogado no servidor, encerra a sessão visual.
+                    currentUser = null;
+                    sessionStorage.removeItem('currentUser');
+                    document.getElementById('app-screen').style.display = 'none';
+                    document.getElementById('login-screen').style.display = 'block';
+                    document.getElementById('login-form').reset();
+                    return null;
+                }
+
+                const atualizada = {
+                    token: sessao.token,
+                    usuario: resposta.usuario,
+                    criadoEm: resposta.criadoEm || sessao.criadoEm,
+                    expiraEm: resposta.expiraEm || sessao.expiraEm
+                };
+
+                await salvarSessaoLocal(atualizada);
+
+                // Atualiza permissões sem interromper o usuário.
+                if (currentUser &&
+                    String(currentUser.username || '') === String(atualizada.usuario.username || '')) {
+                    currentUser = atualizada.usuario;
+                    sessionStorage.setItem('currentUser', JSON.stringify(currentUser));
+                    document.getElementById('user-display').innerText =
+                        `Usuário: ${currentUser.username} (${currentUser.isAdmin ? 'Admin' : 'Comum'})`;
+                    document.getElementById('sub-btn-usuarios').style.display =
+                        currentUser.isAdmin ? 'block' : 'none';
+                }
+
+                return atualizada;
+            } catch (e) {
+                // Falha de rede não bloqueia a sessão local válida.
+                console.warn('Validação remota da sessão será tentada novamente na próxima sincronização.', e);
+                return sessao;
+            }
+        }
+
+        function ativarUsuarioNaInterface(usuario) {
+            currentUser = usuario;
+            sessionStorage.setItem('currentUser', JSON.stringify(currentUser));
+            document.getElementById('login-screen').style.display = 'none';
+            document.getElementById('app-screen').style.display = 'flex';
+            document.getElementById('welcome-screen').style.display = 'none';
+            document.getElementById('user-display').innerText =
+                `Usuário: ${currentUser.username} (${currentUser.isAdmin ? 'Admin' : 'Comum'})`;
+            document.getElementById('sub-btn-usuarios').style.display =
+                currentUser.isAdmin ? 'block' : 'none';
+        }
+
+        function withTimeout(promise, ms=15000) { let timer; return Promise.race([promise, new Promise((_,reject)=>timer=setTimeout(()=>reject(new Error('Timeout de rede')),ms))]).finally(()=>clearTimeout(timer)); }
+        async function postJSONSeguro(payload, timeout=15000) {
+            const response = await withTimeout(fetch(API_URL,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify(payload)}), timeout);
+            const texto = await response.text(); let json;
+            try { json = texto ? JSON.parse(texto) : {}; } catch(e) { throw new Error(`Resposta não-JSON (${response.status}): ${texto.slice(0,200)}`); }
+            if (!response.ok) throw new Error(json.mensagem || `HTTP ${response.status}`);
+            return json;
+        }
+
+        let sincronizacaoInicialEmAndamento = false;
+
+        function agendarSincronizacaoSilenciosa() {
+            if (sincronizacaoInicialEmAndamento) return;
+
+            // Entrega primeiro o controle ao navegador para a interface aparecer.
+            const executar = async () => {
+                if (sincronizacaoInicialEmAndamento) return;
+                sincronizacaoInicialEmAndamento = true;
+                try {
+                    await carregarDadosDaNuvem(false);
+                } catch (e) {
+                    console.warn('Sincronização silenciosa falhou:', e);
+                } finally {
+                    sincronizacaoInicialEmAndamento = false;
+                }
+            };
+
+            if (typeof requestIdleCallback === 'function') {
+                requestIdleCallback(() => executar(), { timeout: 1500 });
+            } else {
+                setTimeout(executar, 150);
+            }
+        }
+
+        async function carregarDadosDaNuvem(mostrarLoading = false) {
+            // Sincronização automática deve ser silenciosa e nunca bloquear a interface.
+            // O loading só aparece se uma rotina específica solicitar explicitamente.
+            const deveMostrarLoading = mostrarLoading;
+            // Primeiro tenta descarregar operações pendentes; depois lê a nuvem já atualizada.
+            await processarFilaOffline();
 
             if (deveMostrarLoading) {
                 showLoading(true, "Sincronizando com o Banco de Dados...");
             }
 
             try {
-                const response = await fetch(`${API_URL}?action=getDados`);
-                const freshData = await response.json();
+                const response = await withTimeout(fetch(`${API_URL}?action=getDados`), 20000);
+                const texto = await response.text();
+                let freshData; try { freshData = JSON.parse(texto); } catch(e) { throw new Error(`Resposta não-JSON da nuvem: ${texto.slice(0,200)}`); }
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
         
                 database = freshData;
                 database.usuarios = database.usuarios || [];
@@ -1784,11 +2017,8 @@
                     t.dataFim = formatarDataTextoBR(t.dataFim);
                 });
 
-                if (!database.usuarios.some(u => u.username === 'admin')) {
-                    database.usuarios.push({ username: 'admin', password: 'admin123', isAdmin: true });
-                }
-
-                localStorage.setItem('TFD_LOCAL_DB', JSON.stringify(database));
+                salvarBancoLocal(database);
+                obterMetaSync().then(m => salvarMetaSync({...m, ultimaSincronizacao: new Date().toISOString()}));
 
                 renderUsuarios();
                 renderPacientes();
@@ -1803,175 +2033,255 @@
             }
         }
 
-        function sincronizarEmSegundoPlano(tipo, registro, chaveOriginal = null) {
-            // 1. Mapeamento para garantir o nome exato da chave dentro do objeto 'database'
+        function sincronizarEmSegundoPlano(tipo, registro, chaveOriginal = null, atualizarBancoLocal = true) {
+            const limparCPF = (cpf) => {
+                if (typeof padCPF === 'function') {
+                    return padCPF(cpf);
+                }
+                return String(cpf || '').replace(/\D/g, '');
+            };
+
             const mapaTipos = {
-                'semestre': 'semestres',
-                'semestres': 'semestres',
-                'trimestre': 'trimestres',
-                'trimestres': 'trimestres',
-                'usuario': 'usuarios',
-                'usuarios': 'usuarios',
-                'paciente': 'pacientes',
-                'pacientes': 'pacientes',
-                'acompanhante': 'acompanhantes',
-                'acompanhantes': 'acompanhantes',
-                'viagem': 'viagens',
-                'viagens': 'viagens'
+                semestre: 'semestres',
+                semestres: 'semestres',
+                trimestre: 'trimestres',
+                trimestres: 'trimestres',
+                usuario: 'usuarios',
+                usuarios: 'usuarios',
+                paciente: 'pacientes',
+                pacientes: 'pacientes',
+                acompanhante: 'acompanhantes',
+                acompanhantes: 'acompanhantes',
+                viagem: 'viagens',
+                viagens: 'viagens'
             };
 
             const chaveDb = mapaTipos[tipo] || tipo;
 
-            // Garante que a coleção existe no objeto database
-            if (!database[chaveDb]) {
+            if (!Array.isArray(database[chaveDb])) {
                 database[chaveDb] = [];
             }
 
-            // 2. Busca e Atualização Local (Memória)
-            if (chaveOriginal !== null && chaveOriginal !== undefined && chaveOriginal !== '') {
-                const index = database[chaveDb].findIndex(item => {
-                    // ACOMPANHANTES: Busca por CPF do Acompanhante + CPF do Paciente
-                    if (chaveDb === 'acompanhantes') {
-                        return padCPF(item.cpf) === padCPF(chaveOriginal) && 
-                               padCPF(item.pacienteCpf) === padCPF(registro.pacienteCpf);
-                    }
-                    // TRIMESTRES: Busca por Trimestre + SemestreChave
-                    if (chaveDb === 'trimestres') {
-                        return item.trimestre === registro.trimestre && 
-                               item.semestreChave === registro.semestreChave;
-                    }
-                    // SEMESTRES: Busca por chaveOriginalSem
-                    if (chaveDb === 'semestres') {
-                        return item.chaveOriginalSem === chaveOriginal;
-                    }
-                    // USUÁRIOS: Busca por username
-                    if (chaveDb === 'usuarios') {
-                        return item.username === chaveOriginal;
-                    }
-                    // PACIENTES: Busca por CPF
-                    if (chaveDb === 'pacientes') {
-                        return padCPF(item.cpf) === padCPF(chaveOriginal);
-                    }
-                    // VIAGENS: Busca por RPB ou ID
-                    if (chaveDb === 'viagens') {
-                        return item.rpb === chaveOriginal || item.id === chaveOriginal;
-                    }
+            if (atualizarBancoLocal) {
+                let index = -1;
 
-                    return item.id === chaveOriginal;
-                });
+                if (chaveOriginal !== null && chaveOriginal !== undefined && chaveOriginal !== '') {
+                    index = database[chaveDb].findIndex(item => {
+                        if (chaveDb === 'acompanhantes') {
+                            if (typeof chaveOriginal === 'object') {
+                                const cpfOriginal = limparCPF(chaveOriginal.cpfOriginal || registro.cpf);
+                                const pacienteCpfOriginal = limparCPF(chaveOriginal.pacienteCpfOriginal || registro.pacienteCpf);
+                                return (
+                                    limparCPF(item.cpf) === cpfOriginal &&
+                                    limparCPF(item.pacienteCpf) === pacienteCpfOriginal
+                                );
+                            }
+                            return limparCPF(item.cpf) === limparCPF(chaveOriginal);
+                        }
 
-                if (index !== -1) {
-                    database[chaveDb][index] = registro;
+                        if (chaveDb === 'trimestres') {
+                            if (typeof chaveOriginal === 'object') {
+                                const trimestreOriginal = String(chaveOriginal.trimestreOriginal || registro.trimestre).trim();
+                                const semestreOriginal = String(chaveOriginal.semestreChaveOriginal || registro.semestreChave).trim();
+                                return (
+                                    String(item.trimestre).trim() === trimestreOriginal &&
+                                    String(item.semestreChave).trim() === semestreOriginal
+                                );
+                            }
+                            return (
+                                String(item.trimestre).trim() === String(chaveOriginal).trim() &&
+                                String(item.semestreChave).trim() === String(registro.semestreChave).trim()
+                            );
+                        }
+
+                        if (chaveDb === 'semestres') {
+                            return String(item.chaveOriginalSem || '').trim() === String(chaveOriginal).trim();
+                        }
+
+                        if (chaveDb === 'pacientes') {
+                            return limparCPF(item.cpf) === limparCPF(chaveOriginal);
+                        }
+
+                        if (chaveDb === 'usuarios') {
+                            return item.username === chaveOriginal;
+                        }
+
+                        if (chaveDb === 'viagens') {
+                            return item.rpb === chaveOriginal || item.id === chaveOriginal;
+                        }
+
+                        return false;
+                    });
+
+                    if (index !== -1) {
+                        database[chaveDb][index] = registro;
+                    }
                 } else {
-                    database[chaveDb].push(registro);
-                }
-            } else {
-                // Se não foi passada chave original, verifica se já existe antes de inserir (evita duplicar em inclusões)
-                const jaExisteIndex = database[chaveDb].findIndex(item => {
-                    if (chaveDb === 'pacientes') return padCPF(item.cpf) === padCPF(registro.cpf);
-                    if (chaveDb === 'usuarios') return item.username === registro.username;
-                    if (chaveDb === 'semestres') return item.chaveOriginalSem === registro.chaveOriginalSem;
-                    if (chaveDb === 'viagens') return item.rpb === registro.rpb;
-                    if (chaveDb === 'acompanhantes') return padCPF(item.cpf) === padCPF(registro.cpf) && padCPF(item.pacienteCpf) === padCPF(registro.pacienteCpf);
-                    if (chaveDb === 'trimestres') return item.trimestre === registro.trimestre && item.semestreChave === registro.semestreChave;
-                    return false;
-                });
+                    const jaExisteIndex = database[chaveDb].findIndex(item => {
+                        if (chaveDb === 'pacientes') {
+                            return limparCPF(item.cpf) === limparCPF(registro.cpf);
+                        }
 
-                if (jaExisteIndex !== -1) {
-                    database[chaveDb][jaExisteIndex] = registro;
-                } else {
-                    database[chaveDb].push(registro);
+                        if (chaveDb === 'usuarios') {
+                            return item.username === registro.username;
+                        }
+
+                        if (chaveDb === 'semestres') {
+                            return String(item.chaveOriginalSem || '').trim() === String(registro.chaveOriginalSem || '').trim();
+                        }
+
+                        if (chaveDb === 'viagens') {
+                            return item.rpb === registro.rpb;
+                        }
+
+                        if (chaveDb === 'acompanhantes') {
+                            return (
+                                limparCPF(item.cpf) === limparCPF(registro.cpf) &&
+                                limparCPF(item.pacienteCpf) === limparCPF(registro.pacienteCpf)
+                            );
+                        }
+
+                        if (chaveDb === 'trimestres') {
+                            return (
+                                String(item.trimestre).trim() === String(registro.trimestre).trim() &&
+                                String(item.semestreChave).trim() === String(registro.semestreChave).trim()
+                            );
+                        }
+
+                        return false;
+                    });
+
+                    if (jaExisteIndex !== -1) {
+                        database[chaveDb][jaExisteIndex] = registro;
+                    } else {
+                        database[chaveDb].push(registro);
+                    }
                 }
+
+                salvarBancoLocal(database);
             }
 
-            // 3. PERSISTÊNCIA IMEDIATA NO LOCALSTORAGE (Offline-First)
-            localStorage.setItem('TFD_LOCAL_DB', JSON.stringify(database));
-
-            // 4. ENVIO PARA O SERVIDOR EM SEGUNDO PLANO
             (async () => {
-                // Cria um identificador único para este envio caso precise ir para a fila offline
                 const idFila = Date.now() + Math.random().toString(36).substr(2, 5);
 
-                var payload = {
-                    idFila: idFila, // Guardamos para controle interno da fila
+                const payload = {
+                    idFila: idFila,
+                    tentativas: 0,
+                    criadoEm: new Date().toISOString(),
                     action: 'salvarRegistroPontual',
                     tipo: tipo,
                     registro: registro
                 };
 
-                if (chaveOriginal) {
+                if (chaveOriginal !== null && chaveOriginal !== undefined && chaveOriginal !== '') {
                     payload.chaveOriginal = chaveOriginal;
                 }
 
                 try {
                     const response = await fetch(API_URL, {
                         method: 'POST',
-                        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+                        headers: {
+                            'Content-Type': 'text/plain;charset=utf-8'
+                        },
                         body: JSON.stringify(payload)
                     });
-            
+
                     const resJson = await response.json();
 
                     if (resJson.status !== 'sucesso') {
                         console.error(`Erro ao salvar ${tipo} na nuvem:`, resJson.mensagem);
-                        // Opcional: Se o erro for do servidor (e não de rede), você também pode enfileirar
-                        salvarNaFilaOffline(payload);
-                    } else {
-                        localStorage.setItem('TFD_LOCAL_DB', JSON.stringify(database));
+
+                        if (typeof salvarNaFilaOffline === 'function') {
+                            salvarNaFilaOffline(payload);
+                        }
                     }
                 } catch (err) {
-                    console.warn(`Erro na rede ao salvar ${tipo}. Enviado para a fila offline.`, err);
-                    // INTERCEPTAÇÃO NO CATCH: Salva o payload para tentar enviar mais tarde
-                    salvarNaFilaOffline(payload);
+                    console.warn(`Erro na rede ao salvar ${tipo}.`, err);
+
+                    if (typeof salvarNaFilaOffline === 'function') {
+                        salvarNaFilaOffline(payload);
+                    }
                 }
             })();
         }
 
         function deletarRegistroPontual(nomeAba, id, pacienteCpf = null, semestreChave = null) {
-            // 1. ENVIO PARA O SERVIDOR EM SEGUNDO PLANO (Função isolada assíncrona)
             (async () => {
-                const idFila = Date.now() + Math.random().toString(36).substr(2, 5);
+                const idFila = Date.now() + Math.random().toString(36).substring(2, 7);
 
-                const payload = { 
-                    idFila: idFila, // ID para controle na fila offline
-                    action: 'deletarRegistroPontual', 
-                    nomeAba: nomeAba, 
-                    id: id 
+                const payload = {
+                    idFila,
+                    tentativas: 0,
+                    criadoEm: new Date().toISOString(),
+                    action: 'deletarRegistroPontual',
+                    nomeAba,
+                    id
                 };
-                if (pacienteCpf) payload.pacienteCpf = pacienteCpf;
-                if (semestreChave) payload.semestreChave = semestreChave;
+
+                if (pacienteCpf !== null && pacienteCpf !== undefined && pacienteCpf !== '') {
+                    payload.pacienteCpf = pacienteCpf;
+                }
+
+                if (semestreChave !== null && semestreChave !== undefined && semestreChave !== '') {
+                    payload.semestreChave = semestreChave;
+                }
 
                 try {
                     const response = await fetch(API_URL, {
                         method: 'POST',
-                        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+                        headers: {
+                            'Content-Type': 'text/plain;charset=utf-8'
+                        },
                         body: JSON.stringify(payload)
                     });
 
-                    const res = await response.json();
+                    const resposta = await response.json();
 
-                    if (res.status !== 'sucesso') {
-                        console.error(`Erro ao deletar em ${nomeAba} no servidor:`, res.mensagem);
-                        // Se o servidor falhar por erro interno, joga na fila para tentar depois
+                    if (resposta.status !== 'sucesso') {
+                        console.error(`Erro ao excluir ${nomeAba}:`, resposta.mensagem);
+
+                        if (typeof salvarNaFilaOffline === 'function') {
+                            salvarNaFilaOffline(payload);
+                        }
+                    }
+                } catch (erro) {
+                    console.warn(`Erro de rede ao excluir ${nomeAba}.`, erro);
+
+                    if (typeof salvarNaFilaOffline === 'function') {
                         salvarNaFilaOffline(payload);
                     }
-                } catch (err) {
-                    console.warn(`Erro de rede ao deletar em ${nomeAba}. Enviado para a fila offline.`, err);
-                    // INTERCEPTAÇÃO NO CATCH: Envia o payload de deleção para a mesma fila offline!
-                    salvarNaFilaOffline(payload);
                 }
             })();
         }
 
-        function salvarNaFilaOffline(payload) {
-            const filaAtual = JSON.parse(localStorage.getItem('TFD_OFFLINE_QUEUE')) || [];
-    
-            // Evita duplicar exatamente o mesmo payload na fila caso o evento dispare duas vezes
-            if (!filaAtual.some(item => item.idFila === payload.idFila)) {
-                filaAtual.push(payload);
-                localStorage.setItem('TFD_OFFLINE_QUEUE', JSON.stringify(filaAtual));
-                console.log(`[Offline] Registro do tipo "${payload.tipo}" guardado na fila. Total: ${filaAtual.length}`);
+        function obterChaveFila(payload) {
+            const limpar = v => String(v || '').replace(/\D/g, '');
+            const aba = payload.tipo || payload.nomeAba || '';
+            const r = payload.registro || {};
+            if (aba === 'paciente' || aba === 'pacientes') return `pacientes:${limpar(r.cpf || payload.id)}`;
+            if (aba === 'acompanhante' || aba === 'acompanhantes') return `acompanhantes:${limpar(r.pacienteCpf || payload.pacienteCpf)}:${limpar(r.cpf || payload.id)}`;
+            if (aba === 'viagem' || aba === 'viagens') return `viagens:${String(r.rpb || payload.id || '').trim()}`;
+            if (aba === 'usuario' || aba === 'usuarios') return `usuarios:${String(r.username || payload.id || '').trim()}`;
+            if (aba === 'semestre' || aba === 'semestres') return `semestres:${String(r.chaveOriginalSem || payload.id || '').trim()}`;
+            if (aba === 'trimestre' || aba === 'trimestres') return `trimestres:${String(r.semestreChave || payload.semestreChave || '')}:${String(r.trimestre || payload.id || '')}`;
+            return `${aba}:${String(payload.id || '')}`;
+        }
+
+        async function salvarNaFilaOffline(payload) {
+            let filaAtual = await carregarFilaLocal();
+            const chave = obterChaveFila(payload);
+            const operacaoAtual = payload.action;
+            const anteriores = filaAtual.filter(item => obterChaveFila(item) !== chave);
+            const anterior = filaAtual.find(item => obterChaveFila(item) === chave);
+
+            // DELETE domina alterações pendentes anteriores do mesmo registro.
+            // SAVE posterior a DELETE representa recriação e substitui a exclusão.
+            if (anterior || !filaAtual.some(item => item.idFila === payload.idFila)) {
+                filaAtual = [...anteriores, payload];
             }
+
+            await salvarFilaLocal(filaAtual);
+            console.log(`[Offline] Operação ${operacaoAtual} guardada/compactada. Total: ${filaAtual.length}`);
         }
 
         // Processa a fila acumulada enviando um item por vez (Sequencial)
@@ -1979,7 +2289,7 @@
             // Se o navegador reportar explicitamente que está offline, nem tenta
             if (!navigator.onLine) return;
 
-            const filaAtual = JSON.parse(localStorage.getItem('TFD_OFFLINE_QUEUE')) || [];
+            const filaAtual = await carregarFilaLocal();
             if (filaAtual.length === 0) return;
 
             console.log(`[Offline] Tentando retransmitir ${filaAtual.length} registro(s) pendente(s)...`);
@@ -1999,16 +2309,26 @@
 
                     if (resJson.status === 'sucesso') {
                         // Se deu certo, remove ESSE item específico da fila oficial
-                        let filaAtualizada = JSON.parse(localStorage.getItem('TFD_OFFLINE_QUEUE')) || [];
+                        let filaAtualizada = await carregarFilaLocal();
                         filaAtualizada = filaAtualizada.filter(item => item.idFila !== payload.idFila);
-                        localStorage.setItem('TFD_OFFLINE_QUEUE', JSON.stringify(filaAtualizada));
+                        await salvarFilaLocal(filaAtualizada);
                         console.log(`[Offline] Registro "${payload.tipo}" retransmitido com sucesso.`);
                     } else {
-                        console.error(`[Offline] Servidor rejeitou item da fila:`, resJson.mensagem);
+                        payload.tentativas = (payload.tentativas || 0) + 1;
+                    payload.ultimaTentativa = new Date().toISOString();
+                    let filaFalha = await carregarFilaLocal();
+                    filaFalha = filaFalha.map(x => x.idFila === payload.idFila ? payload : x);
+                    await salvarFilaLocal(filaFalha);
+                    console.error(`[Offline] Servidor rejeitou item da fila:`, resJson.mensagem);
                         // Se o servidor rejeitou por lógica (ex: validação), paramos para não quebrar a ordem
                         break; 
                     }
                 } catch (error) {
+                    payload.tentativas = (payload.tentativas || 0) + 1;
+                    payload.ultimaTentativa = new Date().toISOString();
+                    let filaFalha = await carregarFilaLocal();
+                    filaFalha = filaFalha.map(x => x.idFila === payload.idFila ? payload : x);
+                    await salvarFilaLocal(filaFalha);
                     console.warn("[Offline] Falha na tentativa de retransmissão. Aguardando próxima conexão...", error);
                     // Se falhou a rede de novo, para o loop e tenta no próximo ciclo
                     break; 
@@ -2016,15 +2336,76 @@
             }
         }
 
+
+        function iniciarSincronizacaoVisualDeReload() {
+            document.documentElement.classList.add('tfd-reload-sync');
+        }
+
+        function finalizarSincronizacaoVisualDeReload() {
+            document.documentElement.classList.remove('tfd-reload-sync');
+        }
+
+        function concluirBootstrapVisual() {
+            document.documentElement.classList.remove('tfd-booting');
+        }
+
+
+        // Rede/IndexedDB não pode deixar a interface invisível indefinidamente.
+        window.setTimeout(() => {
+            if (document.documentElement.classList.contains('tfd-booting')) {
+                console.warn('Bootstrap demorou mais que o esperado; liberando interface.');
+                if (!document.documentElement.classList.contains('tfd-reload-sync')) {
+                    document.documentElement.classList.remove('tfd-booting');
+                }
+            }
+        }, 2500);
+
+        function salvarEstadoAtualParaRestauracao() {
+            try {
+                const tab = sessionStorage.getItem('currentTab');
+                const subTab = sessionStorage.getItem('currentSubTab');
+
+                // Mantém o estado já controlado pelas funções do sistema.
+                // Fallback para classes active caso alguma função ainda não tenha salvo.
+                if (!tab) {
+                    const ativo = document.querySelector('.tab-button.active');
+                    if (ativo && ativo.dataset && ativo.dataset.tab) {
+                        sessionStorage.setItem('currentTab', ativo.dataset.tab);
+                    }
+                }
+                if (!subTab) {
+                    const ativoSub = document.querySelector('.sub-tab-button.active');
+                    if (ativoSub && ativoSub.dataset && ativoSub.dataset.subtab) {
+                        sessionStorage.setItem('currentSubTab', ativoSub.dataset.subtab);
+                    }
+                }
+            } catch (e) {
+                console.warn('Falha ao preservar estado antes do reload:', e);
+            }
+        }
+
+        window.addEventListener('pagehide', salvarEstadoAtualParaRestauracao);
+        window.addEventListener('beforeunload', salvarEstadoAtualParaRestauracao);
+
+        function paginaFoiRecarregada() {
+            try {
+                const nav = performance.getEntriesByType('navigation')[0];
+                if (nav && nav.type === 'reload') return true;
+                return performance.navigation &&
+                    performance.navigation.type === performance.navigation.TYPE_RELOAD;
+            } catch (e) {
+                return false;
+            }
+        }
+
         window.onload = async function() {
             atualizarRelogio();
 
-            // LEITURA IMEDIATA DO CACHE LOCAL (localStorage)
-            const cachedData = localStorage.getItem('TFD_LOCAL_DB');
+            // 1. Carrega o cache local primeiro. Não espera a nuvem.
+            const cachedData = await carregarBancoLocal();
             if (cachedData) {
                 try {
-                    database = JSON.parse(cachedData);
-                    // Renderiza imediatamente com os dados que já estão no cache do navegador
+                    database = cachedData;
                     renderUsuarios();
                     renderPacientes();
                     renderViagens();
@@ -2034,16 +2415,12 @@
                 }
             }
 
-            const savedUser = sessionStorage.getItem('currentUser');
+            // 2. Validação local instantânea do token do IndexedDB.
+            const sessao = await validarSessaoPersistida();
 
-            if (savedUser) {
-                currentUser = JSON.parse(savedUser);
-        
-                document.getElementById('login-screen').style.display = 'none';
-                document.getElementById('app-screen').style.display = 'flex';
-                document.getElementById('welcome-screen').style.display = 'none';
-                document.getElementById('user-display').innerText = `Usuário: ${currentUser.username} (${currentUser.isAdmin ? 'Admin' : 'Comum'})`;
-                document.getElementById('sub-btn-usuarios').style.display = currentUser.isAdmin ? 'block' : 'none';
+            if (sessao && sessao.usuario) {
+                // Em F5 não mostramos a interface antes da sincronização.
+                const foiReload = paginaFoiRecarregada();
 
                 const savedTab = sessionStorage.getItem('currentTab');
                 const savedSubTab = sessionStorage.getItem('currentSubTab');
@@ -2054,79 +2431,122 @@
                 const savedModoSemestre = sessionStorage.getItem('modoSemestreAtual');
                 const savedSemIndex = sessionStorage.getItem('semIndexAtual');
 
-                if (savedTab) {
-                    switchTab(savedTab, true, true);
-                    if (savedTab === 'cadastro' && savedSubTab) {
-                        switchSubTab(savedSubTab, true, true);
-
-                        if (savedSubTab === 'pacientes' && (savedModoPaciente === 'consulta' || savedModoPaciente === 'edicao') && savedPacId !== null && savedPacId !== '') {
-                            consultarPaciente(parseInt(savedPacId, 10));
-                            if (savedModoPaciente === 'edicao') {
-                                ativarEdicaoPaciente();
+                const restaurarEstadoDaPagina = () => {
+                    if (savedTab) {
+                        switchTab(savedTab, true, true);
+                        if (savedTab === 'cadastro' && savedSubTab) {
+                            switchSubTab(savedSubTab, true, true);
+                    
+                            if (savedSubTab === 'pacientes' &&
+                                (savedModoPaciente === 'consulta' || savedModoPaciente === 'edicao') &&
+                                savedPacId !== null && savedPacId !== '') {
+                                consultarPaciente(parseInt(savedPacId, 10));
+                                if (savedModoPaciente === 'edicao') ativarEdicaoPaciente();
+                            }
+                    
+                            if (savedSubTab === 'viagens' &&
+                                (savedModoViagem === 'consulta' || savedModoViagem === 'edicao') &&
+                                savedViaId !== null && savedViaId !== '') {
+                                consultarViagem(parseInt(savedViaId, 10));
+                                if (savedModoViagem === 'edicao') ativarEdicaoViagem();
+                            }
+                    
+                            if (savedSubTab === 'semestres' &&
+                                (savedModoSemestre === 'consulta' || savedModoSemestre === 'edicao') &&
+                                savedSemIndex !== null && savedSemIndex !== '') {
+                                consultarSemestre(parseInt(savedSemIndex, 10));
+                                if (savedModoSemestre === 'edicao') ativarEdicaoSemestre();
                             }
                         }
-
-                        if (savedSubTab === 'viagens' && (savedModoViagem === 'consulta' || savedModoViagem === 'edicao') && savedViaId !== null && savedViaId !== '') {
-                            consultarViagem(parseInt(savedViaId, 10));
-                            if (savedModoViagem === 'edicao') {
-                                ativarEdicaoViagem();
-                            }
-                        }
-
-                        if (savedSubTab === 'semestres' && (savedModoSemestre === 'consulta' || savedModoSemestre === 'edicao') && savedSemIndex !== null && savedSemIndex !== '') {
-                            consultarSemestre(parseInt(savedSemIndex, 10));
-                            if (savedModoSemestre === 'edicao') {
-                                ativarEdicaoSemestre();
-                            }
-                        }
+                    } else {
+                        document.getElementById('welcome-screen').style.display = 'flex';
                     }
+                };
+
+                // 3. Validação do token continua silenciosa em segundo plano.
+                setTimeout(() => {
+                    validarSessaoRemotamenteEmSegundoPlano(sessao);
+                }, 0);
+
+                // F5/reload: não mostra tela inicial antes da sincronização.
+                // O bootstrap mantém as telas invisíveis; o loading de sincronização é a primeira
+                // experiência visual. Depois, restaura exatamente o estado anterior.
+                if (foiReload) {
+                    // Mostra somente o overlay exclusivo do reload. Login e app ficam invisíveis.
+                    iniciarSincronizacaoVisualDeReload();
+                    try {
+                        await carregarDadosDaNuvem(false);
+                    } catch (e) {
+                        console.warn('Sincronização após atualização falhou:', e);
+                    }
+
+                    // Primeiro prepara exatamente o estado anterior, ainda invisível.
+                    ativarUsuarioNaInterface(sessao.usuario);
+                    restaurarEstadoDaPagina();
+
+                    // Só agora remove a camada de sincronização e revela o sistema.
+                    finalizarSincronizacaoVisualDeReload();
+                    concluirBootstrapVisual();
                 } else {
-                    document.getElementById('welcome-screen').style.display = 'flex';
+                    // Acesso normal por token: instantâneo e sincronização silenciosa.
+                    ativarUsuarioNaInterface(sessao.usuario);
+                    restaurarEstadoDaPagina();
+                    concluirBootstrapVisual();
+                    agendarSincronizacaoSilenciosa();
                 }
 
-                carregarDadosDaNuvem(true);
-            } else {
-                carregarDadosDaNuvem(false);
+                return;
             }
 
-            processarFilaOffline();
+            document.getElementById('login-screen').style.display = 'block';
+            document.getElementById('app-screen').style.display = 'none';
+            concluirBootstrapVisual();
+
+            // Sem sessão: a tela de login aparece imediatamente.
+            // A nuvem pode atualizar o cache em segundo plano.
+            agendarSincronizacaoSilenciosa();
         };
 
-        document.getElementById('login-form').addEventListener('submit', function(e) {
+        document.getElementById('login-form').addEventListener('submit', async function(e) {
             e.preventDefault();
-            const uInput = document.getElementById('username').value;
+            const uInput = document.getElementById('username').value.trim();
             const pInput = document.getElementById('password').value;
 
-            let localDb = database;
-            const cachedData = localStorage.getItem('TFD_LOCAL_DB');
-            if (cachedData) {
-                try {
-                    localDb = JSON.parse(cachedData);
-                } catch (err) {
-                    console.error("Erro ao ler cache local:", err);
-                }
+            if (!uInput || !pInput) {
+                alert('Informe usuário e senha.');
+                return;
             }
 
-            const foundUser = localDb.usuarios && localDb.usuarios.find(
-                u => u.username === uInput && String(u.password) === String(pInput)
-            );
+            try {
+                const resposta = await postJSONSeguro(
+                    { action: 'login', username: uInput, password: pInput },
+                    15000
+                );
 
-            if (foundUser) {
-                currentUser = foundUser;
-                sessionStorage.setItem('currentUser', JSON.stringify(currentUser));
-                document.getElementById('user-display').innerText = `Usuário: ${currentUser.username} (${currentUser.isAdmin ? 'Admin' : 'Comum'})`;
-                document.getElementById('sub-btn-usuarios').style.display = currentUser.isAdmin ? 'block' : 'none';
+                if (resposta.status !== 'sucesso' || !resposta.usuario || !resposta.token) {
+                    throw new Error(resposta.mensagem || 'Usuário ou senha incorretos.');
+                }
 
-                document.getElementById('login-screen').style.display = 'none';
-                document.getElementById('app-screen').style.display = 'flex';
-        
+                await salvarSessaoLocal({
+                    token: resposta.token,
+                    usuario: resposta.usuario,
+                    criadoEm: resposta.criadoEm,
+                    expiraEm: resposta.expiraEm
+                });
+
+                // Login concluído: libera a interface imediatamente usando o cache local.
+                ativarUsuarioNaInterface(resposta.usuario);
+                document.getElementById('login-form').reset();
                 irParaInicio(true);
                 renderUsuarios();
                 renderPacientes();
                 renderViagens();
                 renderSemestres();
-            } else {
-                alert('Usuário ou senha incorretos.');
+
+                // Sincronização silenciosa somente depois que a interface já está disponível.
+                agendarSincronizacaoSilenciosa();
+            } catch (erro) {
+                alert(erro.message || 'Usuário ou senha incorretos.');
             }
         });
 
@@ -2150,11 +2570,16 @@
 
         function logout() {
             if (verificarEBloquearNavegacao()) return;
+
+            // O token NÃO é apagado no logout. A sessão permanece válida até o final do dia,
+            // conforme a regra do sistema: sair não deve exigir senha novamente enquanto o token ainda for válido no mesmo dia.
             sessionStorage.removeItem("currentUser");
             currentUser = null;
+
             limparExportPix();
             limparEFecharRPB();
             limparPrestCon();
+
             document.getElementById('app-screen').style.display = 'none';
             document.getElementById('login-screen').style.display = 'block';
             document.getElementById('login-form').reset();
@@ -2330,37 +2755,45 @@
 
         function renderSemestres(filtro = null) {
             const list = document.getElementById('lista-semestres');
+            if (!list) return;
+
             list.innerHTML = '';
 
-            database.semestres.sort((a, b) => 
+            const listaMapeada = (filtro || database.semestres).map((s, indexOriginal) => ({
+                ...s,
+                indexOriginal
+            }));
+
+            const lista = listaMapeada.sort((a, b) => 
                 (a.semestre || '').localeCompare(b.semestre || '', 'pt-BR', { sensitivity: 'base' })
             );
 
-            const lista = filtro || database.semestres;
-
-            if(lista.length === 0) {
+            if (lista.length === 0) {
                 list.innerHTML = `<tr><td colspan="7" style="text-align:center; color:#888;">Nenhum semestre localizado.</td></tr>`;
                 return;
             }
 
+            let htmlBuilder = '';
+
             lista.forEach((s) => {
-                const realIndex = database.semestres.findIndex(item => item.semestre === s.semestre && item.ano === s.ano);
-                list.innerHTML += `
+                htmlBuilder += `
                     <tr>
-                    <td>${s.semestre || ''}</td>
-                    <td>${s.ano || ''}</td>
-                    <td>${mascararProtocolo(s.protPedido) || ''}</td>
-                    <td>${s.valorPedido || ''}</td>
-                    <td>${s.valorLiberado || ''}</td>
-                    <td>${formatarDataTextoBR(s.creditoDisp) || ''}</td>
-                    <td class="actions-cell">
-                        <button class="btn btn-primary" onclick="consultarSemestre(${realIndex})">Ver</button>
-                        <button class="btn btn-warning" onclick="editarSemestre(${realIndex})">Editar</button>
-                        <button class="btn btn-danger" onclick="excluirSemestrePorIndex(${realIndex})">Excluir</button>
+                        <td>${s.semestre || ''}</td>
+                        <td>${s.ano || ''}</td>
+                        <td>${typeof mascararProtocolo === 'function' ? mascararProtocolo(s.protPedido) : (s.protPedido || '')}</td>
+                        <td>${s.valorPedido || ''}</td>
+                        <td>${s.valorLiberado || ''}</td>
+                        <td>${typeof formatarDataTextoBR === 'function' ? formatarDataTextoBR(s.creditoDisp) : (s.creditoDisp || '')}</td>
+                        <td class="actions-cell">
+                            <button type="button" class="btn btn-primary" onclick="consultarSemestre(${s.indexOriginal})">Ver</button>
+                            <button type="button" class="btn btn-warning" onclick="editarSemestre(${s.indexOriginal})">Editar</button>
+                            <button type="button" class="btn btn-danger" onclick="excluirSemestrePorIndex(${s.indexOriginal})">Excluir</button>
                         </td>
                     </tr>
                 `;
             });
+
+            list.innerHTML = htmlBuilder;
         }
 
         function atualizarAbaTrimestreState() {
@@ -2410,21 +2843,21 @@
         }
 
         function consultarSemestre(index) {
-            if (verificarEBloquearNavegacao()) return;
+            if (typeof verificarEBloquearNavegacao === 'function' && verificarEBloquearNavegacao()) return;
             const s = database.semestres[index];
             if (!s) return;
 
             document.getElementById('sem-index').value = index;
-            document.getElementById('sem-chaveOriginalSem').value = s.chaveOriginalSem;
+            document.getElementById('sem-chaveOriginalSem').value = s.chaveOriginalSem || `${s.semestre}_${s.ano}`;
             document.getElementById('sem-semestre').value = s.semestre || '';
             document.getElementById('sem-ano').value = s.ano || '';
-            document.getElementById('sem-protPedido').value = mascararProtocolo(s.protPedido) || '';
+            document.getElementById('sem-protPedido').value = typeof mascararProtocolo === 'function' ? mascararProtocolo(s.protPedido) : (s.protPedido || '');
             document.getElementById('sem-valorPedido').value = s.valorPedido || '';
             document.getElementById('sem-valorLiberado').value = s.valorLiberado || '';
-            document.getElementById('sem-creditoDisp').value = formatarDataParaInputDate(s.creditoDisp);
+            document.getElementById('sem-creditoDisp').value = typeof formatarDataParaInputDate === 'function' ? formatarDataParaInputDate(s.creditoDisp) : (s.creditoDisp || '');
 
             exibirFormularioSemestre('consulta');
-
+            renderTrimestresInternos(s.chaveOriginalSem);
         }
 
         function editarSemestre(index) {
@@ -2455,125 +2888,71 @@
         }
 
         function salvarSemestre(e) {
-            e.preventDefault();
+            if (e) e.preventDefault();
             const semIndex = document.getElementById('sem-index').value;
-
-            // 1. Captura os valores de semestre e ano
-            const semestreValor = document.getElementById('sem-semestre').value;
+            const semestreValor = document.getElementById('sem-semestre').value.trim();
             const anoValor = document.getElementById('sem-ano').value.trim();
-
-            // 2. Cria a nova string combinada
             const chaveGerada = `${semestreValor}_${anoValor}`;
-
-            // 3. Validação de duplicidade (verifica se já existe, ignorando o próprio registro se for edição)
-            const jaExiste = database.semestres.some((s, idx) => 
-                s.semestre === semestreValor && 
-                String(s.ano) === String(anoValor) && 
-                String(idx) !== String(semIndex)
-            );
-
-            if (jaExiste) {
-                return alert('Semestre já cadastrado para este ano.');
-            }
-
-            // Atualiza o input HTML na tela (se houver um campo visual para isso)
+            let idx = Number.isInteger(parseInt(semIndex, 10)) && database.semestres[parseInt(semIndex, 10)] ? parseInt(semIndex, 10) : -1;
             const campoChaveHTML = document.getElementById('sem-chaveOriginalSem');
-            if (campoChaveHTML) {
-                campoChaveHTML.value = chaveGerada;
-            }
+            const chaveAntesDaEdicao = campoChaveHTML ? campoChaveHTML.value.trim() : '';
+            if (idx === -1 && chaveAntesDaEdicao) idx = database.semestres.findIndex(s => String(s.chaveOriginalSem || `${s.semestre}_${s.ano}`).trim() === chaveAntesDaEdicao);
 
-            // Criando o objeto com os novos dados
+            const jaExiste = database.semestres.some((s, i) => String(s.semestre).trim() === semestreValor && String(s.ano).trim() === anoValor && i !== idx);
+            if (jaExiste) return alert('Semestre já cadastrado para este ano.');
+
             const semObjeto = {
-                semestre: semestreValor,
-                ano: anoValor,
-                protPedido: desmascarar(document.getElementById('sem-protPedido').value),
+                semestre: semestreValor, ano: anoValor,
+                protPedido: typeof desmascarar === 'function' ? desmascarar(document.getElementById('sem-protPedido').value) : document.getElementById('sem-protPedido').value,
                 valorPedido: document.getElementById('sem-valorPedido').value,
                 valorLiberado: document.getElementById('sem-valorLiberado').value,
-                creditoDisp: formatarDataTextoBR(document.getElementById('sem-creditoDisp').value),
+                creditoDisp: document.getElementById('sem-creditoDisp').value,
                 chaveOriginalSem: chaveGerada
             };
-
-            let idx = parseInt(semIndex, 10);
-
-            // 4. FLUXO DE EDIÇÃO (Se houver índice válido ou modo edição ativo)
-            if (modoSemestreAtual === 'edicao' || (semIndex !== "" && semIndex !== null && semIndex !== undefined)) {
-                let registroAntigo = null;
-
-                // Se o índice for inválido/NaN por algum motivo, tenta localizar de outra forma
-                if (isNaN(idx) || !database.semestres[idx]) {
-                    idx = database.semestres.findIndex(s => s.chaveOriginalSem === chaveGerada);
-                }
-
-                // Se encontramos o registro, atualiza e faz a cascata nos trimestres
-                if (idx !== -1 && database.semestres[idx]) {
-                    // Guarda o registro antigo antes de sobrescrever para capturar a chaveOriginalSem antiga
-                    registroAntigo = { ...database.semestres[idx] };
-                    database.semestres[idx] = semObjeto;
-                }
-
-                // Atualização em cascata dos trimestres vinculados
-                if (registroAntigo && registroAntigo.chaveOriginalSem !== chaveGerada) {
-                    const chaveAntiga = registroAntigo.chaveOriginalSem;
-
-                    database.trimestres.forEach((t) => {
-                        if (t.semestreChave === chaveAntiga) {
-                            t.semestreChave = chaveGerada; // Atualiza para a nova chave combinada
-                    
-                            // Sincroniza o trimestre modificado em segundo plano
-                            if (typeof sincronizarEmSegundoPlano === 'function') {
-                                sincronizarEmSegundoPlano('trimestres', t);
-                            }
-                        }
+            let chaveAntigaParaSync = null;
+            if (idx !== -1) {
+                chaveAntigaParaSync = database.semestres[idx].chaveOriginalSem || chaveAntesDaEdicao || `${database.semestres[idx].semestre}_${database.semestres[idx].ano}`;
+                database.semestres[idx] = semObjeto;
+                if (chaveAntigaParaSync && chaveAntigaParaSync !== chaveGerada) {
+                    database.trimestres.forEach(t => {
+                        if (String(t.semestreChave || '').trim() === String(chaveAntigaParaSync).trim()) t.semestreChave = chaveGerada;
                     });
                 }
-            } 
-            // 5. FLUXO DE INCLUSÃO (Caso não atenda aos critérios de edição)
-            else {
-                database.semestres.push(semObjeto);
-                // Em caso de inclusão, define o índice para a última posição onde o item foi inserido
-                idx = database.semestres.length - 1; 
-            }
+            } else { database.semestres.push(semObjeto); idx = database.semestres.length - 1; }
 
-            // 6. Finalização e Sincronismo
-            modoSemestreAtual = 'consulta';
-            renderSemestres();
-
-            // Redireciona a consulta para o índice correto (atualizado ou recém-criado)
-            if (idx !== -1 && idx < database.semestres.length) {
-                consultarSemestre(idx);
-            }
-
-            sincronizarEmSegundoPlano('semestres', semObjeto, chaveGerada);
+            salvarBancoLocal(database);
+            if (campoChaveHTML) campoChaveHTML.value = chaveGerada;
+            document.getElementById('sem-index').value = idx;
+            renderSemestres(); renderTrimestresInternos(chaveGerada);
+            modoSemestreAtual = 'consulta'; exibirFormularioSemestre('consulta');
+            sincronizarEmSegundoPlano('semestres', semObjeto, chaveAntigaParaSync, false);
         }
 
         function excluirSemestrePorIndex(index) {
-            if (verificarEBloquearNavegacao()) return;
-    
+            if (typeof verificarEBloquearNavegacao === 'function' && verificarEBloquearNavegacao()) return;
+
             const sem = database.semestres[index];
             if (!sem) return;
 
             const chave = sem.chaveOriginalSem;
 
-
             if (confirm(`Deseja realmente excluir o ${sem.semestre} de ${sem.ano}? Todos os trimestres vinculados serão excluídos!`)) {
                 try {
-
-                    database.trimestres = database.trimestres.filter(t => t.semestreChave !== chave);
-
+                    database.trimestres = database.trimestres.filter(t => String(t.semestreChave).trim() !== String(chave).trim());
                     database.semestres.splice(index, 1);
 
-                    localStorage.setItem('TFD_LOCAL_DB', JSON.stringify(database));
+                    salvarBancoLocal(database);
 
                     renderSemestres();
+                    ocultarFormularioSemestre(true);
 
-                    deletarRegistroPontual('trimestres', null, null, chave);
-
-                    deletarRegistroPontual('semestres', chave);
+                    if (typeof deletarRegistroPontual === 'function') {
+                        deletarRegistroPontual('semestres', chave);
+                    }
 
                     alert("Semestre e trimestres vinculados foram excluídos com sucesso!");
-
                 } catch (error) {
-                    console.error("Erro na exclusão do semestre e seus trimestres vínculados em segundo plano:", error);
+                    console.error("Erro na exclusão do semestre e seus trimestres vinculados:", error);
                 }
             }
         }
@@ -2599,97 +2978,110 @@
             document.getElementById('container-lista-semestres').style.display = 'block';
         }
 
-        function renderTrimestresInternos() {
-            const chaveOriginal = document.getElementById('sem-chaveOriginalSem').value;
-            const chaveSemestre = String(chaveOriginal).trim();
+        function renderTrimestresInternos(chaveForcada = null) {
             const list = document.getElementById('lista-trimestres-semestre');
             if (!list) return;
+
             list.innerHTML = '';
 
-            const trims = database.trimestres
-                .filter(t => String(t.semestreChave).trim() === chaveSemestre)
-                .sort((a, b) => (a.trimestre || '').localeCompare(b.trimestre || '', 'pt-BR', { sensitivity: 'base' }));
+            const campoHTML = document.getElementById('sem-chaveOriginalSem');
+            const chaveOriginal = (chaveForcada !== null && chaveForcada !== undefined) 
+                ? chaveForcada 
+                : (campoHTML ? campoHTML.value : '');
 
-            if(trims.length === 0) {
-                list.innerHTML = `<tr><td colspan="4" style="text-align:center; color:#888;">Nenhum trimestre cadastrado para este semestre.</td></tr>`;
+            const chaveSemestre = String(chaveOriginal).trim();
+
+            if (!chaveSemestre) {
+                list.innerHTML = `<tr><td colspan="5" style="text-align:center; color:#888;">Nenhum semestre selecionado.</td></tr>`;
                 return;
             }
 
-            trims.forEach((t) => {
-                const realIndex = database.trimestres.findIndex(item => item.trimestre === t.trimestre && String(item.semestreChave).trim() === chaveSemestre);
-                list.innerHTML += `
+            const trimsComIndiceReal = database.trimestres
+                .map((t, indexGlobal) => ({ ...t, indexGlobal }))
+                .filter(t => String(t.semestreChave || '').trim() === chaveSemestre)
+                .sort((a, b) => (a.trimestre || '').localeCompare(b.trimestre || '', 'pt-BR', { sensitivity: 'base' }));
+
+            if (trimsComIndiceReal.length === 0) {
+                list.innerHTML = `<tr><td colspan="5" style="text-align:center; color:#888;">Nenhum trimestre cadastrado para este semestre.</td></tr>`;
+                return;
+            }
+
+            let htmlBuilder = '';
+
+            trimsComIndiceReal.forEach((t) => {
+                htmlBuilder += `
                     <tr>
                         <td>${t.trimestre || ''}</td>
-                        <td>${formatarDataTextoBR(t.dataInicio) || ''}</td>
-                        <td>${formatarDataTextoBR(t.dataFim) || ''}</td>
-                        <td>${mascararProtocolo(t.protPrestCon) || ''}</td>
+                        <td>${typeof formatarDataTextoBR === 'function' ? formatarDataTextoBR(t.dataInicio) : (t.dataInicio || '')}</td>
+                        <td>${typeof formatarDataTextoBR === 'function' ? formatarDataTextoBR(t.dataFim) : (t.dataFim || '')}</td>
+                        <td>${typeof mascararProtocolo === 'function' ? mascararProtocolo(t.protPrestCon) : (t.protPrestCon || '')}</td>
                         <td class="actions-cell">
-                            <button class="btn btn-warning" onclick="editarTrimestreInterno(${realIndex})">Editar</button>
-                            <button class="btn btn-danger" onclick="excluirTrimestreInterno(${realIndex})">Excluir</button>
+                            <button type="button" class="btn btn-warning" onclick="editarTrimestreInterno(${t.indexGlobal})">Editar</button>
+                            <button type="button" class="btn btn-danger" onclick="excluirTrimestreInterno(${t.indexGlobal})">Excluir</button>
                         </td>
                     </tr>
                 `;
             });
+
+            list.innerHTML = htmlBuilder;
         }
 
         function salvarTrimestreInterno(e) {
-          e.preventDefault();
-
-          // 1. Captura e tratamento de dados
-          const indexInt = document.getElementById('trim-index-int').value;
-          const trimestreStr = document.getElementById('trim-trimestre').value;
-          const chaveOriginalStr = document.getElementById('sem-chaveOriginalSem').value;
-
-          // 2. Validação de duplicidade (ignora o próprio registro se for edição através do indexInt)
-          const jaExiste = database.trimestres.some((t, idx) => 
-            t.semestreChave === chaveOriginalStr && 
-            t.trimestre === trimestreStr && 
-            String(idx) !== String(indexInt)
-          );
-
-          if (jaExiste) {
-            alert('Este trimestre já foi cadastrado para o semestre atual.');
-            return;
-          }
-
-          // Criando o objeto com os novos dados
-          const trimData = {
-            semestreChave: chaveOriginalStr,
-            trimestre: trimestreStr,
-            dataInicio: document.getElementById('trim-dataInicio').value,
-            dataFim: document.getElementById('trim-dataFim').value,
-            protPrestCon: desmascarar(document.getElementById('trim-protPrestCon').value)
-          };
-
-          // 3. FLUXO DE EDIÇÃO (Se tiver índice preenchido OU a variável de modo for 'edicao')
-          if (modoTrimestreInternoAtual === 'edicao' || (indexInt !== "" && indexInt !== null && indexInt !== undefined)) {
-            let registroAntigo = null;
-            let idx = parseInt(indexInt, 10);
-
-            // Se o índice por acaso for inválido/NaN, tenta buscar pelo trimestre/chave antigo
-            if (isNaN(idx) || !database.trimestres[idx]) {
-              idx = database.trimestres.findIndex(t =>
-                t.trimestre === trimestreStr && 
-                t.semestreChave === chaveOriginalStr
-              );
+            if (e) {
+                e.preventDefault();
             }
 
-            // Se encontramos o registro, fazemos a atualização na exata posição encontrada
-            if (idx !== -1 && database.trimestres[idx]) {
-              registroAntigo = { ...database.trimestres[idx] };
-              database.trimestres[idx] = trimData;
+            const indexInt = document.getElementById('trim-index-int').value;
+            const semestreChave = String(document.getElementById('sem-chaveOriginalSem').value).trim();
+            const trimestre = String(document.getElementById('trim-trimestre').value).trim();
+
+            let idx = indexInt !== '' ? Number(indexInt) : -1;
+
+            const trimData = {
+                semestreChave,
+                trimestre,
+                dataInicio: document.getElementById('trim-dataInicio').value,
+                dataFim: document.getElementById('trim-dataFim').value,
+                protPrestCon: desmascarar(document.getElementById('trim-protPrestCon').value)
+            };
+
+            let trimestreAntigo = null;
+
+            if (idx >= 0 && database.trimestres[idx]) {
+                trimestreAntigo = String(database.trimestres[idx].trimestre || '').trim();
+
+                const duplicado = database.trimestres.some((item, index) => 
+                    index !== idx && 
+                    String(item.semestreChave || '').trim() === semestreChave && 
+                    String(item.trimestre || '').trim() === trimestre
+                );
+
+                if (duplicado) {
+                    alert('Este trimestre já existe neste semestre.');
+                    return;
+                }
+
+                database.trimestres[idx] = trimData;
+            } else {
+                const duplicado = database.trimestres.some(item => 
+                    String(item.semestreChave || '').trim() === semestreChave && 
+                    String(item.trimestre || '').trim() === trimestre
+                );
+
+                if (duplicado) {
+                    alert('Este trimestre já existe neste semestre.');
+                    return;
+                }
+
+                database.trimestres.push(trimData);
             }
-          } 
-          // 4. FLUXO DE INCLUSÃO (Caso não atenda aos critérios de edição)
-          else {
-            database.trimestres.push(trimData);
-          }
 
-          // 5. Finalização e Sincronismo
-          resetFormTrimestreInterno();
-          renderTrimestresInternos(chaveOriginalStr);
+            salvarBancoLocal(database);
 
-          sincronizarEmSegundoPlano('trimestres', trimData);
+            resetFormTrimestreInterno();
+            renderTrimestresInternos(semestreChave);
+
+            sincronizarEmSegundoPlano('trimestres', trimData, trimestreAntigo, false);
         }
 
         function editarTrimestreInterno(indexGlobal) {
@@ -2709,27 +3101,27 @@
         }
 
         function excluirTrimestreInterno(index) {
-            if (verificarEBloquearNavegacao()) return;
+            if (typeof verificarEBloquearNavegacao === 'function' && verificarEBloquearNavegacao()) return;
 
             const t = database.trimestres[index];
-            const trimNome = t.trimestre;
-    
-            if (confirm("Remover este trimestre?")) {
-                const semChave = document.getElementById('sem-chaveOriginalSem').value;
+            if (!t) return;
 
+            const trimNome = t.trimestre;
+            const semChave = String(t.semestreChave || document.getElementById('sem-chaveOriginalSem').value).trim();
+
+            if (confirm("Remover este trimestre?")) {
                 try {
-        
-                    // 1. Atualiza a interface e a memória local imediatamente
                     database.trimestres.splice(index, 1);
+                    salvarBancoLocal(database);
+
                     resetFormTrimestreInterno();
                     renderTrimestresInternos(semChave);
-                    localStorage.setItem('TFD_LOCAL_DB', JSON.stringify(database));
 
-                    // 2. Sincroniza em segundo plano no servidor
-                    deletarRegistroPontual('trimestres', trimNome, null, semChave);
+                    if (typeof deletarRegistroPontual === 'function') {
+                        deletarRegistroPontual('trimestres', trimNome, null, semChave);
+                    }
 
                     alert("Trimestre excluído com sucesso!");
-
                 } catch (error) {
                     console.error("Erro na exclusão do trimestre em segundo plano:", error);
                 }
@@ -2808,29 +3200,38 @@
 
         function salvarUsuario(e) {
             e.preventDefault();
+
             const index = document.getElementById('usr-index').value;
             const usernameOriginal = document.getElementById('usr-username-original').value.trim();
-            const username = document.getElementById('usr-username').value.trim();
-            const password = document.getElementById('usr-password').value.trim();
-            const isAdmin = document.getElementById('usr-is-admin').checked;
 
-            // Validação de duplicação caso esteja inserindo novo ou mudando o nome para um existente
-            if (index === "") {
-                if (database.usuarios.some(u => u.username === username)) return alert('Usuário já existe.');
-                database.usuarios.push({ username, password, isAdmin });
-            } else {
-                if (usernameOriginal !== username && database.usuarios.some(u => u.username === username)) {
-                    return alert('Este nome de usuário já está em uso por outro cadastro.');
+            const usuarioData = {
+                username: document.getElementById('usr-username').value.trim(),
+                password: document.getElementById('usr-password').value.trim(),
+                isAdmin: document.getElementById('usr-is-admin').checked
+            };
+
+            if (index === '') {
+                const duplicado = database.usuarios.some(usuario => usuario.username === usuarioData.username);
+                if (duplicado) {
+                    alert('Usuário já existe.');
+                    return;
                 }
-                database.usuarios[index] = { username, password, isAdmin };
+                database.usuarios.push(usuarioData);
+            } else {
+                const duplicado = database.usuarios.some((usuario, indice) => indice !== Number(index) && usuario.username === usuarioData.username);
+                if (duplicado) {
+                    alert('Este nome de usuário já está em uso.');
+                    return;
+                }
+                database.usuarios[index] = usuarioData;
             }
 
+            salvarBancoLocal(database);
             modoUsuarioAtual = 'consulta';
             ocultarFormularioUsuario(true);
             renderUsuarios();
 
-            // Envia o registro e a chave original de busca para a sincronização
-            sincronizarEmSegundoPlano('usuarios', { username, password, isAdmin }, usernameOriginal);
+            sincronizarEmSegundoPlano('usuarios', usuarioData, usernameOriginal || null, false);
         }
 
         function editarUsuario(index) {
@@ -2839,7 +3240,7 @@
             document.getElementById('usr-index').value = index;
             document.getElementById('usr-username-original').value = u.username;
             document.getElementById('usr-username').value = u.username;
-            document.getElementById('usr-password').value = u.password;
+            document.getElementById('usr-password').value = ''; // senha nunca retorna do cache/servidor
             document.getElementById('usr-is-admin').checked = !!u.isAdmin;
             exibirFormularioUsuario('edicao');
         }
@@ -2857,7 +3258,7 @@
 
                     // 1. Remove localmente
                     database.usuarios.splice(index, 1);
-                    localStorage.setItem('TFD_LOCAL_DB', JSON.stringify(database));
+                    salvarBancoLocal(database);
 
                     // 2. Redesenha a lista de usuários na hora
                     renderUsuarios();
@@ -3045,15 +3446,12 @@
                     database.pacientes.splice(index, 1);
 
                     // 3. Atualiza o cache local
-                    localStorage.setItem('TFD_LOCAL_DB', JSON.stringify(database));
+                    salvarBancoLocal(database);
 
                     renderPacientes();
 
-                    // 4. Atualiza o banco de dados via API
-                    // Deleta todos os acompanhantes vinculados ao CPF do paciente na aba 'acompanhantes'
-                    deletarRegistroPontual('acompanhantes', null, cpfPaciente);
-
-                    // 5. Deleta o cadastro do paciente na aba 'pacientes'
+                    // Atualiza o banco via uma única operação. O backend valida que não
+                    // existem viagens vinculadas e, somente então, remove os acompanhantes.
                     deletarRegistroPontual('pacientes', cpfPaciente);
 
                     alert("Paciente e acompanhantes vinculados foram excluídos com sucesso!");
@@ -3075,85 +3473,93 @@
         }
 
         function salvarPaciente(e) {
-          e.preventDefault();
-          const id = document.getElementById('pac-id').value;
-          const cpfLimpo = desmascarar(document.getElementById('pac-cpf').value);
-          const cpfTratado = padCPF(cpfLimpo);
-          const protocoloLimpo = desmascarar(document.getElementById('pac-protocolo').value);
+            e.preventDefault();
 
-          const pData = {
-            cpf: cpfTratado,
-            rg: document.getElementById('pac-rg').value.trim(),
-            nome: document.getElementById('pac-nome').value.trim(),
-            endereco: document.getElementById('pac-endereco').value.trim(),
-            municipio: document.getElementById('pac-municipio').value.trim(),
-            telefone: document.getElementById('pac-telefone').value,
-            telefone2: document.getElementById('pac-telefone2').value,
-            tratamento: document.getElementById('pac-tratamento').value.trim(),
-            localTratamento: document.getElementById('pac-local-tratamento').value.trim(),
-            protocolo: protocoloLimpo
-          };
+            const id = document.getElementById('pac-id').value;
+            const cpfTratado = padCPF(desmascarar(document.getElementById('pac-cpf').value));
 
-          if (id === "") {
-            // Modo Inclusão
-            if (database.pacientes.some(p => padCPF(p.cpf) === cpfTratado)) {
-              return alert('Já existe um paciente cadastrado com este CPF.');
-            }
-            database.pacientes.push(pData);
-          } else {
-            // Modo Edição
-            // 1. Obtém o CPF antigo antes de atualizar o paciente
-            const cpfAntigo = padCPF(database.pacientes[id].cpf);
+            const pData = {
+                cpf: cpfTratado,
+                rg: document.getElementById('pac-rg').value.trim(),
+                nome: document.getElementById('pac-nome').value.trim(),
+                endereco: document.getElementById('pac-endereco').value.trim(),
+                municipio: document.getElementById('pac-municipio').value.trim(),
+                telefone: document.getElementById('pac-telefone').value,
+                telefone2: document.getElementById('pac-telefone2').value,
+                tratamento: document.getElementById('pac-tratamento').value.trim(),
+                localTratamento: document.getElementById('pac-local-tratamento').value.trim(),
+                protocolo: desmascarar(document.getElementById('pac-protocolo').value)
+            };
 
-            // 2. Se o CPF mudou, verifica se o NOVO CPF já não pertence a outro paciente
-            if (cpfAntigo !== cpfTratado) {
-              if (database.pacientes.some((p, index) => index !== parseInt(id) && padCPF(p.cpf) === cpfTratado)) {
-                return alert('Não é possível alterar para este CPF, pois ele já está cadastrado em outro paciente.');
-              }
-            }
+            let cpfAntigoParaSync = null;
 
-            // 3. Atualiza o cadastro do paciente no array
-            database.pacientes[id] = pData;
-
-            // 4. ATUALIZAÇÃO DOS ACOMPANHANTES VINCULADOS
-            // (Ajuste 'acompanhantes' se o nome do seu array no database for diferente)
-            if (database.acompanhantes) {
-              database.acompanhantes.forEach(a => {
-                if (padCPF(a.pacienteCpf) === cpfAntigo) {
-                  a.pacienteCpf = pData.cpf; // Vincula ao novo CPF do paciente
-          
-                  sincronizarEmSegundoPlano('acompanhantes', a);
+            if (id === '') {
+                const jaExiste = database.pacientes.some(p => padCPF(p.cpf) === cpfTratado);
+                if (jaExiste) {
+                    alert('Já existe um paciente cadastrado com este CPF.');
+                    return;
                 }
-              });
+                database.pacientes.push(pData);
+            } else {
+                const cpfAntigo = padCPF(database.pacientes[id].cpf);
+                cpfAntigoParaSync = cpfAntigo;
+
+                if (cpfAntigo !== cpfTratado) {
+                    const cpfDuplicado = database.pacientes.some((p, index) => index !== Number(id) && padCPF(p.cpf) === cpfTratado);
+                    if (cpfDuplicado) {
+                        alert('Não é possível alterar para este CPF, pois ele já está cadastrado.');
+                        return;
+                    }
+                }
+
+                database.pacientes[id] = pData;
+
+                if (Array.isArray(database.acompanhantes)) {
+                    database.acompanhantes.forEach(a => {
+                        if (padCPF(a.pacienteCpf) === cpfAntigo) {
+                            const cpfAcompanhanteOriginal = padCPF(a.cpf);
+                            a.pacienteCpf = pData.cpf;
+
+                            // A alteração relacional será propagada pelo backend junto ao paciente.
+                        }
+                    });
+                }
+
+                if (Array.isArray(database.viagens)) {
+                    database.viagens.forEach(v => {
+                        if (padCPF(v.cpf) === cpfAntigo) {
+                            const rpbOriginal = String(v.rpb || '').trim();
+
+                            v.cpf = pData.cpf;
+                            v.rg = pData.rg;
+                            v.nome = pData.nome;
+                            v.endereco = pData.endereco;
+                            v.municipio = pData.municipio;
+                            v.telefone = pData.telefone;
+                            v.telefone2 = pData.telefone2;
+                            v.tratamento = pData.tratamento;
+                            v.localTratamento = pData.localTratamento;
+                            v.protocolo = pData.protocolo;
+
+                            // A viagem é atualizada localmente e será propagada pelo backend junto ao paciente.
+                        }
+                    });
+                }
             }
 
-            // 5. VERIFICAÇÃO E ATUALIZAÇÃO DE VIAGENS AGENDADAS
-            database.viagens.forEach(v => {
-              if (padCPF(v.cpf) === cpfAntigo) {
-                v.cpf = pData.cpf; // Atualiza o CPF da viagem para o novo CPF!
-                v.rg = pData.rg;
-                v.nome = pData.nome;
-                v.endereco = pData.endereco;
-                v.municipio = pData.municipio;
-                v.telefone = pData.telefone;
-                v.telefone2 = pData.telefone2;
-                v.tratamento = pData.tratamento;
-                v.localTratamento = pData.localTratamento;
-                v.protocolo = pData.protocolo;
-
-                // Sincroniza em segundo plano cada viagem atualizada
-                sincronizarEmSegundoPlano('viagens', v);
-              }
-            });
-          }
-
+            salvarBancoLocal(database);
             modoPacienteAtual = 'consulta';
+
             renderPacientes();
             renderViagens();
-            renderAcompanhatesPaciente(cpfTratado);
-            consultarPaciente(database.pacientes.findIndex(p => padCPF(p.cpf) === cpfTratado));
+            renderAcompanhantesPaciente(cpfTratado);
 
-            sincronizarEmSegundoPlano('pacientes', pData);
+            const novoIndice = database.pacientes.findIndex(p => padCPF(p.cpf) === cpfTratado);
+            if (novoIndice !== -1) {
+                consultarPaciente(novoIndice);
+            }
+
+            sincronizarEmSegundoPlano('pacientes', pData, cpfAntigoParaSync, false);
         }
 
         function excluirPacienteConsulta() {
@@ -3218,99 +3624,80 @@
         }
 
         function salvarAcompanhanteInterno(e) {
-          e.preventDefault();
+            e.preventDefault();
 
-          // 1. Captura e tratamento de dados
-          const indexInt = document.getElementById('acomp-index-int').value;
-          const pacienteCpfStr = padCPF(desmascarar(document.getElementById('pac-cpf').value));
-          const acompNomeStr = document.getElementById('acomp-nome-int').value.trim();
-          const acompCpfStr = padCPF(desmascarar(document.getElementById('acomp-cpf-int').value));
-          const acompRgStr = document.getElementById('acomp-rg-int').value;
+            const indexInt = document.getElementById('acomp-index-int').value;
+            const pacienteCpf = padCPF(desmascarar(document.getElementById('pac-cpf').value));
+            const acompCpf = padCPF(desmascarar(document.getElementById('acomp-cpf-int').value));
 
-          // 2. Validação de duplicidade (ignora o próprio registro se for edição)
-          const jaExiste = database.acompanhantes.some((a, idx) => 
-            a.pacienteCpf === pacienteCpfStr && 
-            a.cpf === acompCpfStr && 
-            String(idx) !== String(indexInt)
-          );
+            const acompData = {
+                pacienteCpf: pacienteCpf,
+                cpf: acompCpf,
+                nome: document.getElementById('acomp-nome-int').value.trim(),
+                rg: document.getElementById('acomp-rg-int').value
+            };
 
-          if (jaExiste) {
-            alert('Este acompanhante já foi cadastrado para o paciente.');
-            return;
-          }
+            let idx = indexInt !== '' ? Number(indexInt) : -1;
+            let chaveOriginalAcompanhante = null;
 
-          // Criando o objeto com os novos dados
-          const acompData = {
-            pacienteCpf: pacienteCpfStr,
-            cpf: acompCpfStr,
-            nome: acompNomeStr,
-            rg: acompRgStr
-          };
+            if (idx >= 0 && database.acompanhantes[idx]) {
+                const acompanhanteAntigo = { ...database.acompanhantes[idx] };
+                const cpfAntigo = padCPF(acompanhanteAntigo.cpf);
+                const pacienteCpfAntigo = padCPF(acompanhanteAntigo.pacienteCpf);
 
-          // 3. Fluxo de Edição (Verifica primeiro se temos um índice válido ou modo edição)
-          if (modoAcompInternoAtual === 'edicao' || (indexInt !== "" && indexInt !== null)) {
-            let registroAntigo = null;
-            let idx = parseInt(indexInt, 10);
+                chaveOriginalAcompanhante = {
+                    cpfOriginal: cpfAntigo,
+                    pacienteCpfOriginal: pacienteCpfAntigo
+                };
 
-            // Se o índice por acaso for inválido, tenta buscar pelo CPF antigo (mas o índice é o ideal)
-            if (isNaN(idx) || !database.acompanhantes[idx]) {
-              idx = database.acompanhantes.findIndex(a => 
-                padCPF(a.pacienteCpf) === pacienteCpfStr && 
-                padCPF(a.cpf) === acompCpfStr
-              );
-            }
+                const duplicado = database.acompanhantes.some((a, index) => index !== idx && padCPF(a.pacienteCpf) === pacienteCpf && padCPF(a.cpf) === acompCpf);
 
-            // Se encontramos o registro, fazemos a atualização
-            if (idx !== -1 && database.acompanhantes[idx]) {
-              // Guarda uma cópia com os dados antigos (contendo o CPF velho) antes de sobrescrever
-              registroAntigo = { ...database.acompanhantes[idx] };
-              database.acompanhantes[idx] = acompData;
-            }
-
-            // 4. Atualização em cascata nas viagens vinculadas
-            if (registroAntigo) {
-              // Usamos o CPF antigo para a busca nas viagens, garantindo que o vínculo não se perca
-              const cpfParaBuscarEmViagens = padCPF(registroAntigo.cpf);
-      
-              database.viagens.forEach(async (v) => {
-                if (padCPF(v.cpf) === pacienteCpfStr) {
-                  let viagemModificada = false;
-
-                  // Atualiza se for o Acompanhante 1
-                  if (padCPF(v.acompCpf) === cpfParaBuscarEmViagens) {
-                    v.acompNome = acompData.nome;
-                    v.acompCpf = acompData.cpf;
-                    v.acompRg = acompData.rg;
-                    viagemModificada = true;
-                  }
-
-                  // Atualiza se for o Acompanhante 2
-                  if (padCPF(v.acomp2Cpf) === cpfParaBuscarEmViagens) {
-                    v.acomp2Nome = acompData.nome;
-                    v.acomp2Cpf = acompData.cpf;
-                    v.acomp2Rg = acompData.rg;
-                    viagemModificada = true;
-                  }
-
-                  // Sincroniza a viagem modificada de forma assíncrona segura
-                  if (viagemModificada) {
-                    sincronizarEmSegundoPlano('viagens', v);
-                  }
+                if (duplicado) {
+                    alert('Este acompanhante já está cadastrado para este paciente.');
+                    return;
                 }
-              });
-            }
-          } 
-          // 5. Fluxo de Inclusão
-          else {
-            database.acompanhantes.push(acompData);
-          }
 
-          // 6. Finalização e Sincronismo do acompanhante
-          resetFormAcompanhanteInterno();
-          renderAcompanhantesPaciente(pacienteCpfStr);
-  
-          // Aguarda a sincronização principal do acompanhante terminar
-          sincronizarEmSegundoPlano('acompanhantes', acompData);
+                database.acompanhantes[idx] = acompData;
+
+                if (Array.isArray(database.viagens)) {
+                    database.viagens.forEach(viagem => {
+                        let alterou = false;
+
+                        if (padCPF(viagem.acompCpf) === cpfAntigo) {
+                            viagem.acompCpf = acompData.cpf;
+                            viagem.acompNome = acompData.nome;
+                            viagem.acompRg = acompData.rg;
+                            alterou = true;
+                        }
+
+                        if (padCPF(viagem.acomp2Cpf) === cpfAntigo) {
+                            viagem.acomp2Cpf = acompData.cpf;
+                            viagem.acomp2Nome = acompData.nome;
+                            viagem.acomp2Rg = acompData.rg;
+                            alterou = true;
+                        }
+
+                        if (alterou) {
+                            const rpbOriginal = String(viagem.rpb || '').trim();
+                            // A atualização das viagens vinculadas será propagada pelo backend junto ao acompanhante.
+                        }
+                    });
+                }
+            } else {
+                const duplicado = database.acompanhantes.some(a => padCPF(a.pacienteCpf) === pacienteCpf && padCPF(a.cpf) === acompCpf);
+
+                if (duplicado) {
+                    alert('Este acompanhante já está cadastrado para este paciente.');
+                    return;
+                }
+
+                database.acompanhantes.push(acompData);
+            }
+
+            salvarBancoLocal(database);
+            resetFormAcompanhanteInterno();
+            renderAcompanhantesPaciente(pacienteCpf);
+            sincronizarEmSegundoPlano('acompanhantes', acompData, chaveOriginalAcompanhante, false);
         }
 
         function excluirAcompanhanteInterno(index) {
@@ -3338,7 +3725,7 @@
                     database.acompanhantes.splice(index, 1);
                     resetFormAcompanhanteInterno();
                     renderAcompanhantesPaciente(cpfPacAcomp);
-                    localStorage.setItem('TFD_LOCAL_DB', JSON.stringify(database));
+                    salvarBancoLocal(database);
 
                     // 2. Sincroniza em segundo plano no servidor
                     deletarRegistroPontual('acompanhantes', cpfAcomp, cpfPacAcomp);
@@ -3814,16 +4201,21 @@
             if (verificarEBloquearNavegacao()) return;
             consultarViagem(index);
             ativarEdicaoViagem();
+            document.getElementById('via-rpb-original').value = viagem.rpb || '';
         }
 
         function excluirViagemDireta(index) {
             if (verificarEBloquearNavegacao()) return;
+
+            const viagem = database.viagens[index];
+            if (!viagem) return;
+
             if (confirm('Deseja excluir este agendamento de viagem?')) {
                 try {
-                    const rpb = database.viagens[index].rpb;
-                    database.viagens.splice(index, 1);
+                    const rpb = viagem.rpb;
 
-                    localStorage.setItem('TFD_LOCAL_DB', JSON.stringify(database));
+                    database.viagens.splice(index, 1);
+                    salvarBancoLocal(database);
 
                     renderViagens();
 
@@ -3849,20 +4241,21 @@
 
         function salvarViagem(e) {
             e.preventDefault();
-            const index = document.getElementById('via-id').value;
-            const rpbVal = document.getElementById('via-rpb').value;
 
+            const index = document.getElementById('via-id').value;
+            const rpb = document.getElementById('via-rpb').value.trim();
+            const rpbOriginal = document.getElementById('via-rpb-original').value.trim();
             const temAcomp = document.getElementById('via-tem-acomp').checked;
             const tem2Acomp = document.getElementById('via-tem-2acomp').checked;
 
-            let pixValue = document.getElementById('via-pix').value.trim();
-            let pixClean = desmascarar(pixValue);
-            if (pixClean.length === 11) {
-                pixValue = pixClean;
+            let pix = document.getElementById('via-pix').value.trim();
+            const pixLimpo = desmascarar(pix);
+            if (pixLimpo.length === 11) {
+                pix = pixLimpo;
             }
 
             const vData = {
-                rpb: rpbVal,
+                rpb,
                 dataAtendimento: document.getElementById('via-data-atendimento').value,
                 cpf: padCPF(desmascarar(document.getElementById('via-cpf').value)),
                 rg: document.getElementById('via-rg').value,
@@ -3874,52 +4267,60 @@
                 tratamento: document.getElementById('via-tratamento').value,
                 localTratamento: document.getElementById('via-local-tratamento').value,
                 protocolo: desmascarar(document.getElementById('via-protocolo').value),
-
                 datasConsultas: formatarDataTextoBR(document.getElementById('via-dts-consultas').value),
-
-                temAcomp: temAcomp,
-                temDoisAcompanhantes: temAcomp ? tem2Acomp : false,
+                temAcomp,
+                temDoisAcompanhantes: temAcomp && tem2Acomp,
                 acompNome: temAcomp ? document.getElementById('via-acomp').value : '',
                 acompCpf: temAcomp ? padCPF(desmascarar(document.getElementById('via-acomp-cpf').value)) : '',
                 acompRg: temAcomp ? document.getElementById('via-acomp-rg').value : '',
-
-                acomp2Nome: (temAcomp && tem2Acomp) ? document.getElementById('via-acomp2').value : '',
-                acomp2Cpf: (temAcomp && tem2Acomp) ? padCPF(desmascarar(document.getElementById('via-acomp2-cpf').value)) : '',
-                acomp2Rg: (temAcomp && tem2Acomp) ? document.getElementById('via-acomp2-rg').value : '',
-
+                acomp2Nome: temAcomp && tem2Acomp ? document.getElementById('via-acomp2').value : '',
+                acomp2Cpf: temAcomp && tem2Acomp ? padCPF(desmascarar(document.getElementById('via-acomp2-cpf').value)) : '',
+                acomp2Rg: temAcomp && tem2Acomp ? document.getElementById('via-acomp2-rg').value : '',
                 dtPartida: document.getElementById('via-dt-partida').value,
                 dtRetorno: document.getElementById('via-dt-retorno').value,
                 localPartida: document.getElementById('via-local-partida').value,
                 destino: document.getElementById('via-destino').value,
                 localRetorno: document.getElementById('via-local-retorno').value,
-
                 transporteSesa: document.getElementById('via-transporte-sesa').checked,
                 tipoTransporte: document.getElementById('via-tipo-transporte').value,
-
                 diariasPaciente: document.getElementById('via-diarias-paciente').value,
                 diariasAcomp: temAcomp ? document.getElementById('via-diarias-acomp').value : '',
                 valorAjuda: document.getElementById('via-valor-ajuda').value,
-
                 pixEhCpfPaciente: document.getElementById('via-pix-mesmo-cpf').checked,
                 pixEhCpfAcompanhante: document.getElementById('via-pix-cpf-acomp').checked,
-                pix: pixValue,
+                pix,
                 beneficiario: document.getElementById('via-beneficiario').value,
                 dataPgto: document.getElementById('via-data-pgto').value,
                 devolucao: document.getElementById('via-devolucao').value,
                 observacoes: document.getElementById('via-observacoes').value
             };
 
-            if (index === "") {
+            if (index === '') {
+                const duplicado = database.viagens.some(viagem => String(viagem.rpb || '').trim() === rpb);
+                if (duplicado) {
+                    alert('Já existe uma viagem cadastrada com este RPB.');
+                    return;
+                }
                 database.viagens.push(vData);
             } else {
+                const duplicado = database.viagens.some((viagem, indice) => indice !== Number(index) && String(viagem.rpb || '').trim() === rpb);
+                if (duplicado) {
+                    alert('Já existe outra viagem cadastrada com este RPB.');
+                    return;
+                }
                 database.viagens[index] = vData;
             }
 
+            salvarBancoLocal(database);
             modoViagemAtual = 'consulta';
             renderViagens();
-            consultarViagem(database.viagens.findIndex(v => v.rpb === rpbVal));
 
-            sincronizarEmSegundoPlano('viagens', vData);
+            const novoIndice = database.viagens.findIndex(viagem => String(viagem.rpb || '').trim() === rpb);
+            if (novoIndice !== -1) {
+                consultarViagem(novoIndice);
+            }
+
+            sincronizarEmSegundoPlano('viagens', vData, rpbOriginal || null, false);
         }
 
         function excluirViagemConsulta() {
